@@ -96,7 +96,6 @@ Kong is the only container on both networks. `atlassian-mcp` is not a resolvable
 MCP sidecars use `expose` (not `ports`) — they are also unreachable from the developer's laptop directly.
 
 In Kubernetes, the equivalent is a `NetworkPolicy` object on the sidecar pods.
-```
 
 ---
 
