@@ -61,6 +61,7 @@ services:
       CONFLUENCE_URL: "https://${ATLASSIAN_SITE}.atlassian.net"
       CONFLUENCE_USERNAME: "${ATLASSIAN_EMAIL}"
       CONFLUENCE_API_TOKEN: "${ATLASSIAN_API_TOKEN}"
+      TOOLSETS: "all"
     expose:
       - "9000"
     networks:
