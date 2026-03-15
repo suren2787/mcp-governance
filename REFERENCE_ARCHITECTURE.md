@@ -91,33 +91,11 @@ Two Docker networks enforce a hard boundary — not application code:
 | `frontend-net` | `openwebui`, `kong`, `ollama` |
 | `backend-net` | `kong`, `atlassian-mcp`, *(future sidecars)* |
 
-Kong is the only container on both networks. `atlassian-mcp` is not a resolvable hostname on `frontend-net` — the operating system drops the packets. Even a modified `tool_mcp.py` pointing directly at `atlassian-mcp:9000` will time out.
+Kong is the only container on both networks. `atlassian-mcp` is not a resolvable hostname on `frontend-net` — Docker's embedded DNS simply won't answer, so the packet never leaves the AI agent container. Even a modified `tool_mcp.py` calling `atlassian-mcp:9000` directly will time out.
 
-In Kubernetes, the equivalent is a `NetworkPolicy` restricting pod-to-pod traffic.
+MCP sidecars use `expose` (not `ports`) — they are also unreachable from the developer's laptop directly.
 
-```
- ┌──────────────────────────────────── frontend-net ──────────────────────────────────────┐
- │                                                                                         │
- │   ┌─────────────┐         ┌─────────────┐         ┌──────────────────────────────┐    │
- │   │  openwebui  │─────────│    ollama   │         │         kong:8000            │    │
- │   │  :3000      │         │   :11434    │         │   (proxy, reachable here)    │    │
- │   └─────────────┘         └─────────────┘         └──────────────┬───────────────┘    │
- │                                                                   │                    │
- │   openwebui → kong:8000 ✓     openwebui → atlassian-mcp:9000 ✗  │                    │
- │   (DNS resolves on this net)   (DNS fails — name not on net)      │                    │
- └───────────────────────────────────────────────────────────────────│────────────────────┘
-                                                                     │ Kong also on backend-net
- ┌──────────────────────────────────── backend-net ──────────────────│────────────────────┐
- │                                                                   │                    │
- │   ┌──────────────────────┐    ┌──────────────────────┐   ┌───────▼──────────────────┐ │
- │   │   atlassian-mcp:9000 │    │   [future-mcp]:XXXX  │   │  kong (backend interface)│ │
- │   │   expose only        │    │   expose only        │   │  routes to sidecars here │ │
- │   │   no host port       │    │   no host port       │   └──────────────────────────┘ │
- │   └──────────────────────┘    └──────────────────────┘                                │
- │                                                                                         │
- │   Sidecars are invisible outside this network.                                          │
- │   No host port binding = not reachable from the developer's machine either.             │
- └─────────────────────────────────────────────────────────────────────────────────────────┘
+In Kubernetes, the equivalent is a `NetworkPolicy` object on the sidecar pods.
 ```
 
 ---
@@ -154,16 +132,42 @@ In Kubernetes, the equivalent is a `NetworkPolicy` restricting pod-to-pod traffi
   6.   │                         Kong: /new-route → new-mcp:PORT ✓        │
        │                         All 5 controls active immediately        │
        │                         New tools denied until added to ALLOWED  │
+       │                               │                                  │
+  7.   │                         Update tool_mcp.py:                      │
+       │                         - add helper (_mcp or _atlassian_mcp     │
+       │                           pattern depending on transport)        │
+       │                         - add one method per tool in Tools class │
+       │                         Paste into OpenWebUI:                    │
+       │                         Settings → Tools → edit → Save           │
 ```
 
 **What changes per server** (everything else is copy-paste):
 
-| Item | Example |
-|------|---------|
-| Upstream URL | `http://servicenow-mcp:8080` |
-| ALLOWED tool list | `{ get_incident=true, list_tickets=true }` |
-| `mcp_server` log tag | `return 'servicenow'` |
-| Sidecar credentials | New secret in vault |
+| Item | Where | What to change |
+|------|-------|----------------|
+| Upstream URL | `kong.yml` service block | `http://servicenow-mcp:8080` |
+| ALLOWED tool list | `kong.yml` pre-function | `{ get_incident=true, list_tickets=true }` |
+| `mcp_server` log tag | `kong.yml` file-log plugin | `return 'servicenow'` |
+| Sidecar credentials | `docker-compose.yml` + `.env` | New env vars for the sidecar |
+| Helper function | `tool_mcp.py` | Add `_servicenow_mcp()` if the transport needs a session handshake (Streamable-HTTP), or reuse `_mcp()` if it uses plain SSE |
+| Tool methods | `tool_mcp.py` `Tools` class | One method per tool you want the LLM to call |
+| OpenWebUI | Settings → Tools → edit | Paste updated `tool_mcp.py` and save |
+
+**Two MCP transport patterns in `tool_mcp.py`:**
+
+| Pattern | When to use | Helper |
+|---------|-------------|--------|
+| Plain SSE (`_mcp()`) | GitHub-style — single POST, SSE response | Already in `tool_mcp.py` |
+| Streamable-HTTP (`_atlassian_mcp()`) | Requires `initialize` first to get `Mcp-Session-Id`, then the real call | Copy `_atlassian_mcp()`, rename it |
+
+Check which pattern the new sidecar uses with:
+```powershell
+# If initialize returns Mcp-Session-Id header → Streamable-HTTP
+curl -s -D - -X POST http://localhost:8000/newserver/mcp \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+```
 
 ---
 
