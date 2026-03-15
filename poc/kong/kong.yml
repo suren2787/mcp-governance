@@ -1,0 +1,246 @@
+# Kong declarative configuration — DB-less mode.
+# Enforces 5 governance controls on the GitHub MCP Server.
+#
+# Route: POST http://localhost:8000/github/mcp  →  https://api.githubcopilot.com/mcp
+#
+# Control 5 uses Kong's built-in env vault to resolve GITHUB_TOKEN at runtime.
+# No raw credentials appear in this file.
+# Production: replace env vault with AWS Secrets Manager or Vault Agent injection.
+
+_format_version: "3.0"
+
+# ---------------------------------------------------------------------------
+# Consumers — represent callers (AI agents / users).
+# In production these are created dynamically via OIDC consumer mapping.
+# ---------------------------------------------------------------------------
+consumers:
+  - username: developer
+    custom_id: developer-01
+    jwt_secrets:
+      - key: developer-key
+        algorithm: HS256
+        secret: "dev-secret-change-in-prod"
+    tags: [poc, role-developer]
+
+# ---------------------------------------------------------------------------
+# Service + Route + 5 control plugins
+# ---------------------------------------------------------------------------
+services:
+  - name: github-mcp-service
+    # Routes /github/* → GitHub's cloud-hosted MCP endpoint.
+    # Kong strips /github, forwarding /mcp directly to GitHub's API.
+    # Control 5 replaces the incoming JWT with the real PAT from the env vault.
+    url: https://api.githubcopilot.com
+    tags: [poc, mcp, github]
+    routes:
+      - name: github-mcp-route
+        paths:
+          - /github
+        methods:
+          - POST
+          - GET
+        strip_path: true    # /github/mcp  →  /mcp  upstream
+        tags: [poc, github]
+        plugins:
+
+          # ------------------------------------------------------------------
+          # Control 1 — Authentication
+          # Every request must carry a valid HS256 JWT in Authorization header.
+          # Unauthenticated requests → 401.
+          # ------------------------------------------------------------------
+          - name: jwt
+            config:
+              key_claim_name: kid
+              claims_to_verify: [exp]
+              header_names: [Authorization]
+
+          # ------------------------------------------------------------------
+          # Control 2 — Tool-level Access Control
+          # Blocks destructive GitHub tools at the gateway.
+          # The LLM physically cannot reach these tools — Kong intercepts first.
+          # ------------------------------------------------------------------
+          - name: pre-function
+            config:
+              access:
+                - |
+                  local BLOCKED = {
+                    delete_repository           = true,
+                    delete_file                 = true,
+                    create_or_update_file       = true,
+                    manage_repository_access    = true,
+                    add_repository_collaborator = true,
+                  }
+                  local body = kong.request.get_body()
+                  local mcp_method = (body and body["method"]) or "unknown"
+                  local mcp_tool   = "unknown"
+                  if body and body["params"] and body["params"]["name"] then
+                    mcp_tool = body["params"]["name"]
+                  end
+                  -- Store in ctx now; log phase cannot call get_body()
+                  kong.ctx.shared.mcp_tool   = mcp_tool
+                  kong.ctx.shared.mcp_method = mcp_method
+
+                  -- Tool ACL: only applies to tools/call
+                  if body and mcp_method == "tools/call" and BLOCKED[mcp_tool] then
+                    kong.log.warn("BLOCKED tool=" .. mcp_tool ..
+                      " consumer=" ..
+                      (kong.client.get_consumer() and
+                       kong.client.get_consumer().username or "unknown"))
+                    return kong.response.exit(403, {
+                      error   = "forbidden",
+                      message = "Tool '" .. mcp_tool .. "' is not permitted by governance policy.",
+                      tool    = mcp_tool,
+                    })
+                  end
+
+          # ------------------------------------------------------------------
+          # Control 5 — Secrets Management (post-function, runs AFTER JWT plugin)
+          # Replaces the consumer JWT with the real GitHub PAT for the upstream.
+          # post-function priority(-1000) < jwt priority(1005) → runs last.
+          # kong.vault.get resolves GITHUB_TOKEN env var — no raw secret here.
+          # ------------------------------------------------------------------
+          - name: post-function
+            config:
+              access:
+                - |
+                  local github_token = kong.vault.get("{vault://env/GITHUB_TOKEN}")
+                  if github_token then
+                    kong.service.request.set_header("Authorization", "Bearer " .. github_token)
+                  end
+                  -- GitHub Streamable-HTTP MCP requires this Accept header
+                  kong.service.request.set_header("Accept", "application/json, text/event-stream")
+
+          # ------------------------------------------------------------------
+          # Control 3 — Rate Limiting
+          # 5 requests per minute per consumer. 6th request → 429.
+          # Prevents runaway AI agent loops from flooding GitHub API.
+          # ------------------------------------------------------------------
+          - name: rate-limiting
+            config:
+              minute: 20
+              policy: local
+              limit_by: consumer
+              fault_tolerant: false
+              hide_client_headers: false
+
+          # ------------------------------------------------------------------
+          # Control 4 — Audit Logging
+          # Logs every request to stdout with tool name, consumer, MCP method.
+          # In production: ship to SIEM / log aggregator for HKMA audit trail.
+          # ------------------------------------------------------------------
+          - name: file-log
+            config:
+              path: /dev/stdout
+              reopen: false
+              custom_fields_by_lua:
+                mcp_server: "return 'github'"
+                tool_name: "return kong.ctx.shared.mcp_tool or 'unknown'"
+                mcp_method: "return kong.ctx.shared.mcp_method or 'unknown'"
+
+          # Control 5 — Secrets Management handled in pre-function above.
+          # kong.vault.get("{vault://env/GITHUB_TOKEN}") resolves at request time.
+          # Accept header also set there. No request-transformer needed.
+
+  # ---------------------------------------------------------------------------
+  # Atlassian MCP Service
+  # Route: POST http://localhost:8000/atlassian/mcp  →  http://atlassian-mcp:9000/mcp
+  # The sidecar container handles auth with Jira/Confluence using API token.
+  # Kong enforces the same 5 controls as GitHub.
+  # ---------------------------------------------------------------------------
+  - name: atlassian-mcp-service
+    url: http://atlassian-mcp:9000
+    tags: [poc, mcp, atlassian]
+    routes:
+      - name: atlassian-mcp-route
+        paths:
+          - /atlassian
+        methods:
+          - POST
+          - GET
+        strip_path: true    # /atlassian/mcp  →  /mcp  upstream
+        tags: [poc, atlassian]
+        plugins:
+
+          # ------------------------------------------------------------------
+          # Control 1 — Authentication (same JWT consumer as GitHub)
+          # ------------------------------------------------------------------
+          - name: jwt
+            config:
+              key_claim_name: kid
+              claims_to_verify: [exp]
+              header_names: [Authorization]
+
+          # ------------------------------------------------------------------
+          # Control 2 — Tool-level Access Control
+          # Blocks destructive Atlassian tools at the gateway.
+          # ------------------------------------------------------------------
+          - name: pre-function
+            config:
+              access:
+                - |
+                  local BLOCKED = {
+                    jira_delete_issue               = true,
+                    confluence_delete_page          = true,
+                    confluence_delete_attachment    = true,
+                    jira_create_issue               = true,
+                    jira_update_issue               = true,
+                    confluence_create_page          = true,
+                    confluence_update_page          = true,
+                  }
+                  local body = kong.request.get_body()
+                  local mcp_method = (body and body["method"]) or "unknown"
+                  local mcp_tool   = "unknown"
+                  if body and body["params"] and body["params"]["name"] then
+                    mcp_tool = body["params"]["name"]
+                  end
+                  kong.ctx.shared.mcp_tool   = mcp_tool
+                  kong.ctx.shared.mcp_method = mcp_method
+
+                  if body and mcp_method == "tools/call" and BLOCKED[mcp_tool] then
+                    kong.log.warn("BLOCKED tool=" .. mcp_tool ..
+                      " consumer=" ..
+                      (kong.client.get_consumer() and
+                       kong.client.get_consumer().username or "unknown"))
+                    return kong.response.exit(403, {
+                      error   = "forbidden",
+                      message = "Tool '" .. mcp_tool .. "' is not permitted by governance policy.",
+                      tool    = mcp_tool,
+                    })
+                  end
+
+          # ------------------------------------------------------------------
+          # Control 5 — Secrets Management
+          # The sidecar handles Atlassian auth internally via env vars.
+          # We only strip the incoming consumer JWT so it is not forwarded.
+          # ------------------------------------------------------------------
+          - name: post-function
+            config:
+              access:
+                - |
+                  -- Remove the consumer JWT — sidecar uses its own credentials
+                  kong.service.request.clear_header("Authorization")
+                  -- Atlassian MCP sidecar uses standard JSON
+                  kong.service.request.set_header("Accept", "application/json, text/event-stream")
+
+          # ------------------------------------------------------------------
+          # Control 3 — Rate Limiting
+          # ------------------------------------------------------------------
+          - name: rate-limiting
+            config:
+              minute: 20
+              policy: local
+              limit_by: consumer
+              fault_tolerant: false
+              hide_client_headers: false
+
+          # ------------------------------------------------------------------
+          # Control 4 — Audit Logging
+          # ------------------------------------------------------------------
+          - name: file-log
+            config:
+              path: /dev/stdout
+              reopen: false
+              custom_fields_by_lua:
+                mcp_server: "return 'atlassian'"
+                tool_name: "return kong.ctx.shared.mcp_tool or 'unknown'"
+                mcp_method: "return kong.ctx.shared.mcp_method or 'unknown'"

@@ -1,0 +1,13 @@
+# Secrets — never commit these
+poc/.env
+
+# Docker volumes and runtime artifacts
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp

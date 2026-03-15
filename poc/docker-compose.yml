@@ -1,0 +1,126 @@
+
+# ---------------------------------------------------------------------------
+# Network topology — two isolated networks enforce the governance boundary.
+#
+#   frontend-net:  openwebui ↔ kong ↔ ollama
+#                  AI agent can ONLY reach Kong — no direct path to any MCP sidecar.
+#
+#   backend-net:   kong ↔ atlassian-mcp (and any future MCP sidecars)
+#                  MCP sidecars are invisible to openwebui at the network layer.
+#
+# This means: even if tool_mcp.py were modified to call atlassian-mcp:9000
+# directly, the Docker network would drop the packets. Congress cannot be
+# bypassed by application code alone.
+# ---------------------------------------------------------------------------
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kong Gateway — sits on BOTH networks; it is the only bridge between them.
+  # Admin API bound to localhost only — never expose port 8001 publicly.
+  # ---------------------------------------------------------------------------
+  kong:
+    image: kong:3.7
+    container_name: kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /etc/kong/kong.yml
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_ADMIN_LISTEN: "127.0.0.1:8001"
+      KONG_LOG_LEVEL: info
+      KONG_PLUGINS: bundled
+      KONG_UNTRUSTED_LUA: "on"
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      ATLASSIAN_EMAIL: "${ATLASSIAN_EMAIL}"
+      ATLASSIAN_API_TOKEN: "${ATLASSIAN_API_TOKEN}"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./kong/kong.yml:/etc/kong/kong.yml:ro
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - frontend-net   # reachable by openwebui / AI agents
+      - backend-net    # reachable by MCP sidecars
+
+  # ---------------------------------------------------------------------------
+  # Atlassian MCP sidecar — backend-net only.
+  # openwebui has no route to this container; Kong is the sole entry point.
+  # ---------------------------------------------------------------------------
+  atlassian-mcp:
+    image: ghcr.io/sooperset/mcp-atlassian:latest
+    container_name: atlassian-mcp
+    command: ["--transport", "streamable-http", "--port", "9000"]
+    environment:
+      JIRA_URL: "https://${ATLASSIAN_SITE}.atlassian.net"
+      JIRA_USERNAME: "${ATLASSIAN_EMAIL}"
+      JIRA_API_TOKEN: "${ATLASSIAN_API_TOKEN}"
+      CONFLUENCE_URL: "https://${ATLASSIAN_SITE}.atlassian.net"
+      CONFLUENCE_USERNAME: "${ATLASSIAN_EMAIL}"
+      CONFLUENCE_API_TOKEN: "${ATLASSIAN_API_TOKEN}"
+    expose:
+      - "9000"
+    networks:
+      - backend-net    # NOT on frontend-net — invisible to openwebui
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Ollama — local LLM runtime. frontend-net only (OpenWebUI talks to it).
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    expose:
+      - "11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - frontend-net
+    healthcheck:
+      test: ["CMD", "ollama", "ps"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # OpenWebUI — frontend-net only. Can reach kong:8000 and ollama:11434.
+  # Cannot reach atlassian-mcp:9000 or any future backend MCP sidecar.
+  # Access at http://localhost:3000
+  # ---------------------------------------------------------------------------
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    environment:
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      WEBUI_SECRET_KEY: "poc-secret-change-in-prod"
+    ports:
+      - "3000:8080"
+    volumes:
+      - openwebui-data:/app/backend/data
+    depends_on:
+      kong:
+        condition: service_healthy
+      atlassian-mcp:
+        condition: service_healthy
+    networks:
+      - frontend-net   # no backend-net — enforces Kong-only path at network layer
+
+networks:
+  frontend-net:
+    driver: bridge
+    # AI agents (openwebui) + Kong proxy port + Ollama
+  backend-net:
+    driver: bridge
+    # Kong (backend interface) + MCP sidecars only
+
+volumes:
+  ollama-data:
+  openwebui-data:
